@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <stdarg.h>
 
+#include "../compat/asprintf.h"
+
 #if HAVE_VISIBILITY
 #define HIDDEN __attribute__ ((visibility("hidden")))
 #else
@@ -21,10 +23,6 @@ size_t HIDDEN strlcpy(char *, const char *, size_t);
 
 #ifndef HAVE_STRCASESTR
 char HIDDEN *strcasestr(const char *, const char *);
-#endif
-
-#ifndef HAVE_VASPRINTF
-int HIDDEN vasprintf(char **, const char *, va_list);
 #endif
 
 #ifndef HAVE_HUMANIZE_HUMBER
