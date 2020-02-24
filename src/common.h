@@ -165,7 +165,7 @@ fetchIO		*ftp_request(struct url *, const char *, const char *,
 /*
  * Check whether a particular flag is set
  */
-#define CHECK_FLAG(x)	(flags && strchr(flags, (x)))
+#define CHECK_FLAG(x)	1
 
 #ifndef __UNCONST
 #define __UNCONST(a)    ((void *)(unsigned long)(const void *)(a))

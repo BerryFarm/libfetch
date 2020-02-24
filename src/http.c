@@ -721,8 +721,6 @@ http_connect(struct url *URL, struct url *purl, const char *flags, int *cached)
 {
 	struct url *curl;
 	conn_t *conn;
-	const char *p;
-	hdr_t h;
 	int af, verbose;
 #ifdef TCP_NOPUSH
 	int val;
@@ -761,25 +759,10 @@ http_connect(struct url *URL, struct url *purl, const char *flags, int *cached)
 		http_cmd(conn, "\r\n");
 
 		if (http_get_reply(conn) != HTTP_OK) {
-			http_seterr(conn->err);
 			fetch_close(conn);
 			return (NULL);
 		}
-		/* Read and discard the rest of the proxy response */
-		do {
-			switch ((h = http_next_header(conn, &p))) {
-			case hdr_syserror:
-				fetch_syserr();
-				fetch_close(conn);
-				return (NULL);
-			case hdr_error:
-				http_seterr(HTTP_PROTOCOL_ERROR);
-				fetch_close(conn);
-				return (NULL);
-			default:
-				/* ignore */ ;
-			}
-		} while (h > hdr_end);
+		http_get_reply(conn);
 	}
 	if (strcasecmp(URL->scheme, SCHEME_HTTPS) == 0 &&
 	    fetch_ssl(conn, URL, verbose) == -1) {
@@ -935,7 +918,7 @@ http_request(struct url *URL, const char *op, struct url_stat *us,
 		if (verbose)
 			fetch_info("requesting %s://%s%s",
 			    url->scheme, host, url->doc);
-		if (purl && strcasecmp(url->scheme, SCHEME_HTTPS) != 0) {
+		if (purl && strcasecmp(URL->scheme, SCHEME_HTTPS) != 0) {
 			http_cmd(conn, "%s %s://%s%s HTTP/1.1\r\n",
 			    op, url->scheme, host, url->doc);
 		} else {
@@ -949,7 +932,7 @@ http_request(struct url *URL, const char *op, struct url_stat *us,
 		/* virtual host */
 		http_cmd(conn, "Host: %s\r\n", host);
 
-		if (strcasecmp(url->scheme, SCHEME_HTTPS) != 0)
+		if (strcasecmp(URL->scheme, SCHEME_HTTPS) != 0)
 			send_proxy_headers(conn, purl);
 
 		/* server authorization */
@@ -1470,7 +1453,8 @@ parse_index(struct index_parser *parser, const char *buf, size_t len)
 			return -1;
 		return end_attr + 1 - buf;
 	}
-	return -1;
+	/* NOTREACHED */
+	abort();
 }
 
 struct http_index_cache {

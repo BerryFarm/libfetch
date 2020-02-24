@@ -4,7 +4,6 @@
  * Copyright (c) 1998-2014 Dag-Erling Smorgrav
  * Copyright (c) 2008, 2010 Joerg Sonnenberger <joerg@NetBSD.org>
  * Copyright (c) 2013 Michael Gmelin <freebsd@grem.de>
- * Copyright (c) 2019 Duncan Overbruck <mail@duncano.de>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -54,8 +53,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <strings.h>
-#include <poll.h>
-#include <fcntl.h>
 
 #ifndef MSG_NOSIGNAL
 #include <signal.h>
@@ -277,19 +274,11 @@ fetch_bind(int sd, int af, const char *addr)
 int
 fetch_socks5(conn_t *conn, struct url *url, struct url *socks, int verbose)
 {
-	char buf[262];
+	char buf[16];
 	uint8_t auth;
 	size_t alen;
-	ssize_t dlen;
 
 	alen = strlen(url->host);
-	if (alen > 255) {
-		if (verbose)
-			fetch_info("socks5 only supports addresses <= 255 bytes");
-		errno = EINVAL;
-		return -1;
-	}
-
 	auth = (*socks->user != '\0' && *socks->pwd != '\0')
 	    ? SOCKS5_USER_PASS : SOCKS5_NO_AUTH;
 
@@ -360,20 +349,20 @@ fetch_socks5(conn_t *conn, struct url *url, struct url *socks, int verbose)
 		fetch_info("connecting socks5 to %s:%d", url->host, url->port);
 
 	/* write request */
-	dlen = 0;
-	buf[dlen++] = SOCKS5_VERSION;
-	buf[dlen++] = SOCKS5_TCP_STREAM;
-	buf[dlen++] = 0x00;
-	buf[dlen++] = SOCKS5_ATYPE_DOMAIN;
-	buf[dlen++] = alen;
+	buf[0] = SOCKS5_VERSION;
+	buf[1] = SOCKS5_TCP_STREAM;
+	buf[2] = 0x00;
+	buf[3] = SOCKS5_ATYPE_DOMAIN;
+	buf[4] = alen;
+	if (fetch_write(conn, buf, 5) != 5)
+		return -1;
 
-	memcpy(&buf[dlen], url->host, alen);
-	dlen += alen;
+	if (fetch_write(conn, url->host, alen) == -1)
+		return -1;
 
-	buf[dlen++] = (url->port >> 0x08);
-	buf[dlen++] = (url->port & 0xFF);
-
-	if (fetch_write(conn, buf, dlen) != dlen)
+	buf[0] = (url->port >> 0x08);
+	buf[1] = (url->port & 0xFF);
+	if (fetch_write(conn, buf, 2) != 2)
 		return -1;
 
 	/* read answer */
@@ -429,239 +418,6 @@ fetch_socks5(conn_t *conn, struct url *url, struct url *socks, int verbose)
 }
 
 /*
- * Happy Eyeballs (RFC8305):
- *
- * Connect to the addresses in res0, alternating between
- * address family, starting with ipv6 and waits `fetchConnDelay`
- * between each connection attempt.
- *
- * If a connection is established within the attempts,
- * use this connection and close all others.
- *
- * If `connect(3)` returns `ENETUNREACH`, don't attempt more
- * connections with the failing address family.
- *
- * If there are no more addresses to attempt, wait for
- * `fetchConnTimeout` and return the first established
- * connection.
- *
- * If no connection was established within the timeouts,
- * close all sockets and return -1 and set errno to
- * `ETIMEDOUT`.
- */
-#define UNREACH_IPV6 0x01
-#define UNREACH_IPV4 0x10
-static int
-happy_eyeballs_connect(struct addrinfo *res0, int verbose)
-{
-	static int unreach = 0;
-	struct pollfd *pfd;
-	struct addrinfo *res;
-	const char *bindaddr;
-	int optval;
-	socklen_t optlen = sizeof(optval);
-	int rv = -1;
-	int err = 0;
-	int timeout = fetchConnDelay;
-	unsigned int attempts = 0, waiting = 0;
-	unsigned int i, n4, n6, i4, i6, done = 0;
-
-	bindaddr = getenv("FETCH_BIND_ADDRESS");
-
-	for (n4 = n6 = 0, res = res0; res; res = res->ai_next)
-		switch (res->ai_family) {
-		case AF_INET6: n6++; break;
-		case AF_INET: n4++; break;
-		}
-
-#ifdef FULL_DEBUG
-	fetch_info("got %d A and %d AAAA records", n4, n6);
-#endif
-
-	i4 = i6 = 0;
-	if (unreach & UNREACH_IPV6 || getenv("FORCE_IPV4"))
-		i6 = n6;
-	if (unreach & UNREACH_IPV4 || getenv("FORCE_IPV6"))
-		i4 = n4;
-
-	if (n6+n4 == 0 || i6+i4 == n6+n4) {
-		netdb_seterr(EAI_FAIL);
-		return -1;
-	}
-
-	if (!(pfd = calloc(n4+n6, sizeof (struct pollfd)))) {
-		fetch_syserr();
-		return -1;
-	}
-
-	res = NULL;
-	for (;;) {
-		int sd = -1;
-		int ret;
-		unsigned short family = 0;
-
-#ifdef FULL_DEBUG
-		if (verbose)
-		    fetch_info("happy eyeballs state: i4=%u n4=%u i6=%u n6=%u"
-		        " attempts=%u waiting=%u", i4, n4, i6, n6, attempts, waiting);
-#endif
-
-		if (i6+i4 < n6+n4) {
-			/* first round when res == NULL, prefer ipv6 */
-			if (res == NULL || res->ai_family == AF_INET) {
-				/* prefer ipv6 */
-				if (i6 < n6)
-					family = AF_INET6;
-				else if (i4 < n4)
-					family = AF_INET;
-			} else {
-				/* prefer ipv4 */
-				if (i4 < n4)
-					family = AF_INET;
-				else if (i6 < n6)
-					family = AF_INET6;
-			}
-		} else {
-			/* no more connections to try */
-			if (verbose)
-				fetch_info("attempted to connect to all addresses, waiting...");
-			timeout = fetchConnTimeout;
-			done = 1;
-			goto wait;
-		}
-
-
-		for (i = 0, res = res0; res; res = res->ai_next) {
-			if (res->ai_family == family) {
-				if (family == AF_INET && i == i4) {
-					i4++;
-					break;
-				}
-				if (family == AF_INET6 && i == i6) {
-					i6++;
-					break;
-				}
-				i++;
-			}
-		}
-		if (res == NULL) {
-			netdb_seterr(EAI_FAIL);
-			goto out;
-		}
-
-		if ((sd = socket(res->ai_family, res->ai_socktype | SOCK_NONBLOCK,
-		    res->ai_protocol)) == -1)
-			continue;
-
-		if (bindaddr != NULL && *bindaddr != '\0' &&
-		    fetch_bind(sd, res->ai_family, bindaddr) != 0) {
-			fetch_info("failed to bind to '%s'", bindaddr);
-			close(sd);
-			continue;
-		}
-
-		if (verbose) {
-			char hbuf[1025];
-			if (getnameinfo(res->ai_addr, res->ai_addrlen, hbuf, sizeof(hbuf), NULL,
-			    0, NI_NUMERICHOST) == 0)
-				fetch_info("connecting to %s", hbuf);
-		}
-
-		if (connect(sd, res->ai_addr, res->ai_addrlen) == -1) {
-			if (errno == EINPROGRESS) {
-				pfd[attempts].fd = sd;
-			} else if (errno == ENETUNREACH) {
-				close(sd);
-				if (family == AF_INET) {
-					i4 = n4;
-					unreach |= UNREACH_IPV4;
-				} else {
-					i6 = n6;
-					unreach |= UNREACH_IPV6;
-				}
-				continue;
-			} else if (errno == EADDRNOTAVAIL) {
-				err = errno;
-				close(sd);
-				continue;
-			} else {
-				err = errno;
-				rv = -1;
-				close(sd);
-				break;
-			}
-		} else {
-			/* XXX: does this actually happen? */
-			rv = sd;
-			break;
-		}
-
-		attempts++;
-		waiting++;
-wait:
-		if (!attempts) {
-			netdb_seterr(EAI_FAIL);
-			rv = -1;
-			goto out;
-		}
-		for (i = 0; i < attempts; i++) {
-			pfd[i].revents = pfd[i].events = 0;
-			if (pfd[i].fd != -1)
-				pfd[i].events = POLLOUT;
-		}
-		if (!waiting)
-			break;
-		if ((ret = poll(pfd, attempts, timeout ? timeout : -1)) == -1) {
-			err = errno;
-			rv = -1;
-			break;
-		} else if (ret > 0) {
-			sd = -1;
-			for (i = 0; i < attempts; i++) {
-				if (pfd[i].revents & POLLHUP) {
-					/* connection failed, save errno */
-					if ((getsockopt(pfd[i].fd, SOL_SOCKET, SO_ERROR, &optval, &optlen)) == 0)
-						err = optval;
-					close(pfd[i].fd);
-					pfd[i].fd = -1;
-					waiting--;
-				} else if (pfd[i].revents & POLLOUT) {
-					/* connection established */
-					err = 0;
-					sd = pfd[i].fd;
-					break;
-				}
-			}
-			if (sd != -1) {
-				rv = sd;
-				break;
-			}
-		} else if (done) {
-			err = ETIMEDOUT;
-			rv = -1;
-			break;
-		}
-	}
-
-out:
-	for (i = 0; i < attempts; i++)
-		if ((rv == -1 || rv != pfd[i].fd) && pfd[i].fd != -1)
-			close(pfd[i].fd);
-	free(pfd);
-
-	if (rv != -1) {
-		if (fcntl(rv, F_SETFL, fcntl(rv, F_GETFL, 0) & ~O_NONBLOCK) == -1) {
-			err = errno;
-			close(rv);
-			rv = -1;
-		}
-	}
-	if ((errno = err))
-		fetch_syserr();
-	return rv;
-}
-
-/*
  * Establish a TCP connection to the specified port on the specified host.
  */
 conn_t *
@@ -670,8 +426,8 @@ fetch_connect(struct url *url, int af, int verbose)
 	conn_t *conn;
 	char pbuf[10];
 	struct url *socks_url, *connurl;
-	const char *socks_proxy;
-	struct addrinfo hints, *res0;
+	const char *bindaddr, *socks_proxy;
+	struct addrinfo hints, *res, *res0;
 	int sd, error;
 
 	socks_url = NULL;
@@ -704,14 +460,31 @@ fetch_connect(struct url *url, int af, int verbose)
 		netdb_seterr(error);
 		return (NULL);
 	}
+	bindaddr = getenv("FETCH_BIND_ADDRESS");
 
 	if (verbose)
 		fetch_info("connecting to %s:%d", connurl->host, connurl->port);
 
-	sd = happy_eyeballs_connect(res0, verbose);
+	/* try to connect */
+	for (sd = -1, res = res0; res; sd = -1, res = res->ai_next) {
+		if ((sd = socket(res->ai_family, res->ai_socktype,
+			 res->ai_protocol)) == -1)
+			continue;
+		if (bindaddr != NULL && *bindaddr != '\0' &&
+		    fetch_bind(sd, res->ai_family, bindaddr) != 0) {
+			fetch_info("failed to bind to '%s'", bindaddr);
+			close(sd);
+			continue;
+		}
+		if (connect(sd, res->ai_addr, res->ai_addrlen) == 0)
+			break;
+		close(sd);
+	}
 	freeaddrinfo(res0);
-	if (sd == -1)
+	if (sd == -1) {
+		fetch_syserr();
 		return (NULL);
+	}
 
 	if ((conn = fetch_reopen(sd)) == NULL) {
 		fetch_syserr();
@@ -1122,7 +895,7 @@ fetch_ssl_verify_altname(STACK_OF(GENERAL_NAME) *altnames,
 
 	for (i = 0; i < sk_GENERAL_NAME_num(altnames); ++i) {
 		name = sk_GENERAL_NAME_value(altnames, i);
-		ns = (const char *)ASN1_STRING_get0_data(name->d.ia5);
+		ns = (const char *)ASN1_STRING_data(name->d.ia5);
 		nslen = (size_t)ASN1_STRING_length(name->d.ia5);
 
 		if (name->type == GEN_DNS && ip == NULL &&
